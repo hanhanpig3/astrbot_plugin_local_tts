@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# AstrBot plugin runtime
+.astrbot-plugin/
+*.log
+
+# 私有音频样本: 本插件的参考音/克隆样本是机器人独有音色, 绝不入库
+*.wav
+*.ogg
+*.mp3
+refs/
+demos/
+
+# 本机部署目录/环境 (指向外部 GPT-SoVITS 部署, 不入库)
+tts_ref.env
+service/
+.DS_Store
+data/

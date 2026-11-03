@@ -1,0 +1,9 @@
+name: astrbot_plugin_local_tts
+desc: 在 AstrBot 启动时自动拉起本地 GPT-SoVITS 调音 TTS 服务（引擎 + 调音包装），AstrBot WebUI 的「GSVI TTS(API)」源配置 api_base 指向本服务即可使用。支持语速/音调/音量调音与参考音频音色克隆。
+help: 插件随 AstrBot 启停本地 TTS 服务。命令：/tts_status 查看服务状态与地址；/tts_restart 重启服务。在 AstrBot WebUI 的语音合成配置里选择「GSVI TTS(API)」，api_base 填插件显示的地址（默认 http://127.0.0.1:9881），即可用本地调好音色的声音。配置项：service_dir 指向本机 GPT-SoVITS 部署目录（含 .venv 与 GPT-SoVITS/）；engine_port/tts_port 端口；default_speed/pitch/volume 默认调音参数。
+version: v1.0.0
+author: hanhanpig3
+repo: "https://github.com/hanhanpig3/astrbot_plugin_local_tts"
+display_name: 本地 GPT-SoVITS 调音 TTS
+short_desc: 随 AstrBot 启动本地 GPT-SoVITS TTS 服务（调音+克隆）
+astrbot_version: ">=4.5.7"
