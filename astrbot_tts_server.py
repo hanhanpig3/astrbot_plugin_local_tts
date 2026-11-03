@@ -355,7 +355,7 @@ async def infer_single(request: Request):
         top_k=15, top_p=1.0, temperature=1.0,
         cut_punc=None, output_format="wav",
     )
-    if not isinstance(audio, Response):  # 出错时是 JSONResponse
+    if isinstance(audio, JSONResponse):  # 出错时是 JSONResponse, 直接返回错误
         return audio
 
     import uuid

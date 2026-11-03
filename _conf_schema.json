@@ -21,7 +21,7 @@
   },
   "default_speed": {
     "type": "float",
-    "default": 1.0,
+    "default": 0.85,
     "description": "默认语速 0.5~2.0（0.85 略慢）。"
   },
   "default_pitch": {

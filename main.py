@@ -56,7 +56,10 @@ class LocalTtsPlugin(Star):
                     if not line or line.startswith("#") or "=" not in line:
                         continue
                     k, _, v = line.partition("=")
-                    env[k.strip()] = v.strip().strip('"').strip("'")
+                    k = k.strip()
+                    if k.startswith("export "):
+                        k = k[len("export "):].strip()
+                    env[k] = v.strip().strip('"').strip("'")
             except OSError as e:
                 logger.warning("local_tts: 读取 tts_ref.env 失败: %s", e)
         return env
