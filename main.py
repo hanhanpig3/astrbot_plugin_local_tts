@@ -87,9 +87,12 @@ class LocalTtsPlugin(Star):
                 "s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"))
 
             # 1. GPT-SoVITS 推理引擎 (cwd 必须是 GPT-SoVITS/ 目录, 模型路径相对该目录)
+            device = str(self.config.get("engine_device", "") or "mps").strip().lower()
+            if device not in ("mps", "cuda", "cpu"):
+                device = "mps"
             engine_cmd = [
                 str(py), "api.py",
-                "-d", "mps", "-a", "0.0.0.0", "-p", str(engine_port),
+                "-d", device, "-a", "0.0.0.0", "-p", str(engine_port),
                 "-s", s2, "-g", s1,
             ]
             engine_log = open(ENGINE_LOG, "ab")

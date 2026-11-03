@@ -39,6 +39,11 @@
     "default": "",
     "description": "对外可访问的服务地址（留空自动用 http://127.0.0.1:<tts_port>）。AstrBot 与本服务同一台机时留空即可。"
   },
+  "engine_device": {
+    "type": "string",
+    "default": "mps",
+    "description": "推理加速设备: mps(Apple Silicon) / cuda(NVIDIA GPU) / cpu。mac 用 mps, Linux/Windows 有 NVIDIA 用 cuda, 否则 cpu。"
+  },
   "engine_model_s2": {
     "type": "string",
     "default": "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth",
