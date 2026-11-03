@@ -43,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import httpx
@@ -104,6 +105,21 @@ def _engine_tts(payload: dict) -> bytes:
         resp = client.post(f"{ENGINE_URL}/", json=payload)
         resp.raise_for_status()
         return resp.content
+
+
+def _has_audio_data(wav_bytes: bytes) -> bool:
+    """判断 wav 是否包含实际音频数据(非空 data 块)。
+
+    引擎冷启动(模型未加载完)时可能返回只有 wav 头、data 为 0 字节的音频,
+    这种"假成功"会让调用方(AstrBot)下载到空文件而报错。
+    """
+    if not wav_bytes:
+        return False
+    try:
+        data, _sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=False)
+        return data.size > 0
+    except Exception:
+        return False
 
 
 def _apply_tuning(wav_bytes: bytes, pitch: float, volume_db: float):
@@ -191,11 +207,25 @@ def _do_tts(text, text_language, speed, pitch, volume, refer_wav_path,
 
     # 串行化: 同一时刻只有一个请求进入推理引擎
     with _tts_lock:
-        try:
-            wav_bytes = _engine_tts(payload)
-        except Exception as e:
+        wav_bytes = None
+        last_err = None
+        # 引擎冷启动(模型加载/MPS 编译)时可能返回空音频, 重试等待暖机
+        for attempt in range(6):
+            try:
+                wav_bytes = _engine_tts(payload)
+            except Exception as e:
+                last_err = e
+                wav_bytes = None
+            else:
+                if wav_bytes and _has_audio_data(wav_bytes):
+                    break
+                last_err = "引擎返回空音频(可能仍在加载模型)"
+                wav_bytes = None
+            if attempt < 5:
+                time.sleep(3.0)
+        if wav_bytes is None:
             return JSONResponse(
-                {"code": 502, "message": f"TTS 引擎调用失败: {e}"}, status_code=502
+                {"code": 502, "message": f"TTS 引擎调用失败: {last_err}"}, status_code=502
             )
         wav_bytes = _apply_tuning(wav_bytes, float(pitch or 0.0), float(volume or 0.0))
 
