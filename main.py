@@ -120,8 +120,8 @@ class LocalTtsPlugin(Star):
                 return
             env = os.environ.copy()
             env["SEEDVC_DIR"] = str(sing_dir / "seed-vc")
-            env["VC_CHECKPOINT"] = str(self._resolve_path(str(self.config.get("sing_checkpoint", ""))))
-            env["VC_CONFIG"] = str(self._resolve_path(str(self.config.get("sing_config", ""))))
+            env["SVC_CHECKPOINT"] = str(self._resolve_path(str(self.config.get("sing_checkpoint", ""))))
+            env["SVC_CONFIG"] = str(self._resolve_path(str(self.config.get("sing_config", ""))))
             env["SING_PORT"] = str(int(self.config.get("sing_port", 9882)))
             sing_log = open(SING_LOG, "ab")
             try:
@@ -370,6 +370,87 @@ class LocalTtsPlugin(Star):
             ])
         except Exception as e:
             yield event.plain_result(f"唱歌转换异常: {e}")
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    @filter.command("sing_mix")
+    async def sing_mix(self, event: AstrMessageEvent, source_path: str = "", ref: str = ""):
+        """唱歌+伴奏: 用小鲸鱼唱完整歌曲 (自动 demucs 分离人声+伴奏, 合成完整版)。
+
+        /sing_mix <歌曲路径>        完整歌曲是本机 wav/mp3 路径 (带伴奏)
+        /sing_mix                   附带音频附件作为完整歌曲
+        可选: ref=<参考音路径>      覆盖默认小鲸鱼参考音
+        """
+        if not bool(self.config.get("sing_enable", False)):
+            yield event.plain_result("唱歌模式未启用。请先在插件配置里开启 sing_enable 并重启 AstrBot。")
+            return
+        if not self._sing_ready():
+            yield event.plain_result("唱歌服务未运行。请使用 /sing_restart 启动 (首次模型加载约 1-2 分钟)。")
+            return
+
+        source = (source_path or "").strip()
+        if not source:
+            att = self._find_audio_attachment(event)
+            if att:
+                source = att
+        if not source:
+            yield event.plain_result(
+                "请提供完整歌曲：/sing_mix <本机 wav/mp3 路径>，或直接发送一段音频附件。\n"
+                "可选 ref=<参考音路径> 覆盖默认小鲸鱼参考音。"
+            )
+            return
+
+        ref_path = self._sing_ref()
+        if ref:
+            ref = ref.strip()
+            if ref.startswith("ref="):
+                ref = ref[len("ref="):].strip()
+            ref_path = self._resolve_path(ref)
+        if not ref_path.exists():
+            yield event.plain_result(f"参考音不存在: {ref_path}")
+            return
+
+        import tempfile as _tf
+        tmp = None
+        if str(source).startswith("http"):
+            try:
+                r = requests.get(source, timeout=120)
+                r.raise_for_status()
+                tmp = _tf.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp.write(r.content)
+                tmp.close()
+                source = tmp.name
+            except Exception as e:
+                yield event.plain_result(f"下载歌曲失败: {e}")
+                return
+
+        yield event.plain_result("🎤 正在用小鲸鱼唱完整歌曲... (分离人声+伴奏+转换, 约需 1-3 分钟)")
+        try:
+            resp = requests.post(
+                f"{self._sing_url()}/sing_mix",
+                json={
+                    "source": source,
+                    "target": str(ref_path),
+                    "diffusion_steps": int(self.config.get("sing_diffusion_steps", 25)),
+                },
+                timeout=900,
+            )
+            if resp.status_code != 200:
+                yield event.plain_result(f"唱歌合成失败: HTTP {resp.status_code} {resp.text[:200]}")
+                return
+            out = _tf.NamedTemporaryFile(suffix=".wav", delete=False)
+            out.write(resp.content)
+            out.close()
+            yield event.chain_result([
+                Plain(f"小鲸鱼唱完整歌曲完成: {len(resp.content)//1024}KB"),
+                Record(file=out.name),
+            ])
+        except Exception as e:
+            yield event.plain_result(f"唱歌合成异常: {e}")
         finally:
             if tmp:
                 try:

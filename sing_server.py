@@ -1,14 +1,16 @@
-"""Seed-VC 音色转换常驻 HTTP 服务 (VC 模式, f0-condition=False)。
+"""Seed-VC 音色转换常驻 HTTP 服务 (SVC 模式, f0-condition=True, 音调保留)。
 
 用于 AstrBot 本地 TTS 插件的「唱歌」功能:
-  1. 用 Seed-VC VC 模型 (DiT_seed_v2_uvit_whisper_small_wavenet) 做零样本音色转换
-  2. source = 唱歌干声, target = 参考音色 (如小鲸鱼说话参考音)
-  3. POST /sing {source, target} -> wav bytes
+  1. 用 Seed-VC SVC 模型 (DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2)
+     做零样本音色转换, f0 强制保留 (音调对齐参考音中位数, 音调不乱)
+  2. source = 唱歌干声(无伴奏人声), target = 参考音色 (如小鲸鱼说话参考音)
+  3. POST /sing  {source, target}                     -> 纯人声 wav
+     POST /sing_mix {source, target}                  -> 完整歌曲 wav (demucs 分离人声+伴奏, SVC 转人声, 混合伴奏)
 
 依赖环境变量:
   SEEDVC_DIR   : seed-vc 仓库目录
-  VC_CHECKPOINT: VC 主权重 .pth 路径
-  VC_CONFIG    : VC config .yml 路径
+  SVC_CHECKPOINT: SVC 主权重 .pth (DiT_seed_v2_uvit_whisper_base_f0_44k_..._v2.pth)
+  SVC_CONFIG   : SVC config .yml (config_dit_mel_seed_uvit_whisper_base_f0_44k.yml)
   SING_PORT    : 服务端口 (默认 9882)
 """
 
@@ -16,8 +18,10 @@ import os
 import sys
 import json
 import time
+import tempfile
 import threading
 import argparse
+import subprocess
 import numpy as np
 import torch
 import torchaudio
@@ -33,21 +37,21 @@ import inference as seedvc  # noqa: E402  # 加载 seed-vc 模块 (设置 device
 
 def _load_model():
     args = argparse.Namespace(
-        checkpoint=os.environ["VC_CHECKPOINT"],
-        config=os.environ["VC_CONFIG"],
+        checkpoint=os.environ.get("SVC_CHECKPOINT") or os.environ["VC_CHECKPOINT"],
+        config=os.environ.get("SVC_CONFIG") or os.environ["VC_CONFIG"],
         fp16=True,
-        f0_condition=False,
-        diffusion_steps=int(os.environ.get("VC_DIFFUSION_STEPS", 25)),
-        length_adjust=float(os.environ.get("VC_LENGTH_ADJUST", 1.0)),
-        inference_cfg_rate=float(os.environ.get("VC_CFG_RATE", 0.7)),
+        f0_condition=True,
+        diffusion_steps=int(os.environ.get("SVC_DIFFUSION_STEPS", 25)),
+        length_adjust=float(os.environ.get("SVC_LENGTH_ADJUST", 1.0)),
+        inference_cfg_rate=float(os.environ.get("SVC_CFG_RATE", 0.7)),
     )
-    print("[sing] 加载 Seed-VC VC 模型...", flush=True)
+    print("[sing] 加载 Seed-VC SVC 模型 (f0=True)...", flush=True)
     model, semantic_fn, f0_fn, vocoder_fn, campplus_model, mel_fn, mel_args = seedvc.load_models(args)
     print(f"[sing] 模型加载完成 sr={mel_args['sampling_rate']} device={seedvc.device}", flush=True)
-    return model, semantic_fn, vocoder_fn, campplus_model, mel_fn, mel_args["sampling_rate"]
+    return model, semantic_fn, f0_fn, vocoder_fn, campplus_model, mel_fn, mel_args["sampling_rate"]
 
 
-MODEL, SEMANTIC, VOCODER, CAMPPLUS, MELFN, SR = _load_model()
+MODEL, SEMANTIC, F0FN, VOCODER, CAMPPLUS, MELFN, SR = _load_model()
 DEVICE = seedvc.device
 HOP = 256 if SR == 22050 else 512
 MAX_CTX = SR // HOP * 30
@@ -58,7 +62,7 @@ _convert_lock = threading.Lock()
 
 @torch.no_grad()
 def convert(source, target, diffusion_steps=25, length_adjust=1.0, inference_cfg_rate=0.7):
-    """Seed-VC VC 转换: source 干声 -> target 参考音色。返回 (wave float32 numpy, sr)。"""
+    """Seed-VC SVC 转换: source 干声 -> target 参考音色。返回 (wave float32 numpy, sr)。"""
     with _convert_lock:
         source_audio = librosa.load(source, sr=SR)[0]
         ref_audio = librosa.load(target, sr=SR)[0]
@@ -99,8 +103,15 @@ def convert(source, target, diffusion_steps=25, length_adjust=1.0, inference_cfg
         feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
         style2 = CAMPPLUS(feat2.unsqueeze(0))
 
-        cond, _, _, _, _ = MODEL.length_regulator(S_alt, ylens=target_lengths, n_quantizers=3, f0=None)
-        prompt_condition, _, _, _, _ = MODEL.length_regulator(S_ori, ylens=target2_lengths, n_quantizers=3, f0=None)
+        # SVC: 提取 F0。保留源 F0 (auto_f0_adjust=False, 音调=原歌), 不对齐到参考
+        F0_ori = F0FN(ori_waves_16k[0], thred=0.03)
+        F0_alt = F0FN(converted_waves_16k[0], thred=0.03)
+        F0_ori = torch.from_numpy(F0_ori).float().to(DEVICE)[None]
+        F0_alt = torch.from_numpy(F0_alt).float().to(DEVICE)[None]
+        shifted_f0_alt = F0_alt  # 保留源 F0, 音调 = 原歌音高
+
+        cond, _, _, _, _ = MODEL.length_regulator(S_alt, ylens=target_lengths, n_quantizers=3, f0=shifted_f0_alt)
+        prompt_condition, _, _, _, _ = MODEL.length_regulator(S_ori, ylens=target2_lengths, n_quantizers=3, f0=F0_ori)
 
         max_source_window = MAX_CTX - mel2.size(2)
         processed_frames = 0
@@ -146,6 +157,59 @@ def convert(source, target, diffusion_steps=25, length_adjust=1.0, inference_cfg
         return wave.astype(np.float32), SR
 
 
+def _demucs_vocals_and_accompaniment(audio_path: str, workdir: str):
+    """demucs 分离人声+伴奏。返回 (vocals_path, accompaniment_path)。"""
+    out_dir = os.path.join(workdir, "demucs")
+    os.makedirs(out_dir, exist_ok=True)
+    # demucs 用本 venv python (已装 demucs)
+    cmd = [
+        sys.executable, "-m", "demucs.separate", "-n", "htdemucs",
+        "--two-stems=vocals", "-o", out_dir, audio_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=1800)
+    base = os.path.splitext(os.path.basename(audio_path))[0]
+    stem_dir = os.path.join(out_dir, "htdemucs", base)
+    return os.path.join(stem_dir, "vocals.wav"), os.path.join(stem_dir, "no_vocals.wav")
+
+
+def _mix(whale_wav: str, acc_wav: str, out_wav: str, vocal_gain=1.0, acc_gain=0.85):
+    """混合小鲸鱼人声 + 伴奏 -> 完整歌曲。"""
+    voc, sr1 = librosa.load(whale_wav, sr=None, mono=True)
+    acc, sr2 = librosa.load(acc_wav, sr=None, mono=True)
+    sr = min(sr1, sr2)
+    voc = librosa.resample(voc, orig_sr=sr1, target_sr=sr) if sr1 != sr else voc
+    acc = librosa.resample(acc, orig_sr=sr2, target_sr=sr) if sr2 != sr else acc
+    n = min(len(voc), len(acc))
+    voc, acc = voc[:n], acc[:n]
+    mixed = vocal_gain * voc + acc_gain * acc
+    peak = np.max(np.abs(mixed))
+    if peak > 0.98:
+        mixed = mixed * (0.98 / peak)
+    sf_write(out_wav, mixed.astype(np.float32), sr)
+    return sr
+
+
+def sf_write(path, data, sr):
+    import soundfile as _sf
+    _sf.write(path, data, sr)
+
+
+def convert_and_mix(source, target, diffusion_steps=25, length_adjust=1.0, inference_cfg_rate=0.7,
+                    vocal_gain=1.0, acc_gain=0.85):
+    """完整流程: demucs 分离 -> SVC 转小鲸鱼 -> 混合伴奏。返回 (out_wav_path, sr)。"""
+    with tempfile.TemporaryDirectory() as workdir:
+        vocals_path, acc_path = _demucs_vocals_and_accompaniment(source, workdir)
+        wave, sr = convert(vocals_path, target, diffusion_steps, length_adjust, inference_cfg_rate)
+        whale_wav = os.path.join(workdir, "whale.wav")
+        import soundfile as _sf
+        _sf.write(whale_wav, wave, sr)
+        out_wav = os.path.join(workdir, "full.wav")
+        _mix(whale_wav, acc_path, out_wav, vocal_gain, acc_gain)
+        with open(out_wav, "rb") as f:
+            data = f.read()
+        return data, sr
+
+
 class SingHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -161,11 +225,31 @@ class SingHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(length))
+
+    def _send_wav(self, wav_bytes):
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(wav_bytes)))
+        self.end_headers()
+        self.wfile.write(wav_bytes)
+
+    def _send_error(self, e):
+        import traceback
+        traceback.print_exc()
+        self.send_response(500)
+        self.send_header("Content-Type", "application/json")
+        body = json.dumps({"error": str(e)}).encode()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
-        if self.path.startswith("/sing"):
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                data = json.loads(self.rfile.read(length))
+        try:
+            if self.path.startswith("/sing"):
+                data = self._read_json()
                 source = data["source"]
                 target = data["target"]
                 diffusion_steps = int(data.get("diffusion_steps", 25))
@@ -173,28 +257,27 @@ class SingHandler(BaseHTTPRequestHandler):
                 cfg_rate = float(data.get("inference_cfg_rate", 0.7))
                 t0 = time.time()
                 wave, sr = convert(source, target, diffusion_steps, length_adjust, cfg_rate)
-                # 写 wav 到内存
                 import io
                 buf = io.BytesIO()
                 torchaudio.save(buf, torch.from_numpy(wave).unsqueeze(0), sr, format="wav")
                 wav_bytes = buf.getvalue()
-                print(f"[sing] 转换完成 {time.time()-t0:.1f}s {len(wave)/sr:.1f}s audio", flush=True)
-                self.send_response(200)
-                self.send_header("Content-Type", "audio/wav")
-                self.send_header("Content-Length", str(len(wav_bytes)))
-                self.end_headers()
-                self.wfile.write(wav_bytes)
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                body = json.dumps({"error": str(e)}).encode()
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-        else:
-            self.send_error(404)
+                print(f"[sing] /sing 转换完成 {time.time()-t0:.1f}s {len(wave)/sr:.1f}s audio", flush=True)
+                self._send_wav(wav_bytes)
+            elif self.path.startswith("/sing_mix"):
+                data = self._read_json()
+                source = data["source"]
+                target = data["target"]
+                diffusion_steps = int(data.get("diffusion_steps", 25))
+                length_adjust = float(data.get("length_adjust", 1.0))
+                cfg_rate = float(data.get("inference_cfg_rate", 0.7))
+                t0 = time.time()
+                wav_bytes, sr = convert_and_mix(source, target, diffusion_steps, length_adjust, cfg_rate)
+                print(f"[sing] /sing_mix 完成 {time.time()-t0:.1f}s (demucs+SVC+mix)", flush=True)
+                self._send_wav(wav_bytes)
+            else:
+                self.send_error(404)
+        except Exception as e:
+            self._send_error(e)
 
 
 if __name__ == "__main__":
