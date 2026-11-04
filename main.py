@@ -308,9 +308,12 @@ class LocalTtsPlugin(Star):
             )
             return
 
-        # 参考音: 显式 ref 参数 > 配置默认
+        # 参考音: 显式 ref 参数 > 配置默认 (ref= 前缀可能有)
         ref_path = self._sing_ref()
         if ref:
+            ref = ref.strip()
+            if ref.startswith("ref="):
+                ref = ref[len("ref="):].strip()
             ref_path = self._resolve_path(ref)
         if not ref_path.exists():
             yield event.plain_result(f"参考音不存在: {ref_path}")
