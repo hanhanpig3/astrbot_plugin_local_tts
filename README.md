@@ -221,6 +221,75 @@ git clone https://github.com/hanhanpig3/astrbot_plugin_local_tts.git ~/data/plug
 
 ---
 
+## 唱歌模式（Seed-VC 音色转换）
+
+文字 TTS（GPT-SoVITS）是「文本→说话」，没有旋律输入，**无法直接唱歌**。本项目用 **Seed-VC 零样本音色转换**补上唱歌能力：把一段「唱歌干声」的音色换成小鲸鱼（或任何参考音色），保留干声的旋律。
+
+> 原理：输入「唱歌干声 + 参考音色」→ 输出「参考音色唱干声的旋律」。
+
+### 1. 准备唱歌环境（一次即可）
+
+需要**独立的 Python 3.10 环境**（不与 GPT-SoVITS 的 `.venv` 混用，避免 torch 版本冲突）：
+
+```bash
+mkdir -p ~/localtts/sing_lab && cd ~/localtts/sing_lab
+python3.10 -m venv venv
+./venv/bin/pip install "torch==2.4.0" "torchaudio==2.4.0"
+./venv/bin/pip install "scipy==1.13.1" "librosa==0.10.2" "numpy==1.26.4" \
+  "huggingface_hub>=0.28.1" "munch==4.0.0" "einops==0.8.0" \
+  "descript-audio-codec==1.0.0" "pydub==0.25.1" "resemblyzer" "jiwer==3.0.3" \
+  "transformers==4.46.3" "soundfile==0.12.1" "hydra-core==1.3.2" "pyyaml" \
+  "python-dotenv" "accelerate"
+```
+
+下载 Seed-VC 源码 + 权重（国内走 hf-mirror.com）：
+
+```bash
+cd ~/localtts/sing_lab
+# Seed-VC 源码 (GitHub 被墙用 curl 下载 zip; 也可用代理 git clone)
+curl -L -o seed-vc.zip "https://github.com/Plachtaa/seed-vc/archive/refs/heads/main.zip"
+unzip -q seed-vc.zip && mv seed-vc-main seed-vc
+
+# VC 主权重 + config (hf-mirror)
+cd seed-vc
+mkdir -p checkpoints models/bigvgan_22k models/whisper-small
+curl -L -o checkpoints/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth \
+  "https://hf-mirror.com/Plachta/Seed-VC/resolve/main/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth"
+# bigvgan 声码器 + whisper 模型 (hf-mirror)
+curl -L -o models/bigvgan_22k/config.json "https://hf-mirror.com/nvidia/bigvgan_v2_22khz_80band_256x/resolve/main/config.json"
+curl -L -o models/bigvgan_22k/bigvgan_generator.pt "https://hf-mirror.com/nvidia/bigvgan_v2_22khz_80band_256x/resolve/main/bigvgan_generator.pt"
+curl -L -o models/whisper-small/config.json "https://hf-mirror.com/openai/whisper-small/resolve/main/config.json"
+curl -L -o models/whisper-small/model.safetensors "https://hf-mirror.com/openai/whisper-small/resolve/main/model.safetensors"
+curl -L -o models/whisper-small/preprocessor_config.json "https://hf-mirror.com/openai/whisper-small/resolve/main/preprocessor_config.json"
+```
+
+> 本插件配套的 `seed-vc/inference.py` 与 `config_dit_mel_seed_uvit_whisper_small_wavenet.yml` 已改为**加载本地 `checkpoints/models/` 目录**（绕过 huggingface_hub 直连 HF 被墙）。下载后按上述路径放置即可。
+
+### 2. 在 AstrBot 插件配置里启用唱歌
+
+| 配置项 | 说明 |
+| --- | --- |
+| `sing_enable` | `true`（默认关闭） |
+| `sing_dir` | 唱歌环境目录，如 `~/localtts/sing_lab` |
+| `sing_checkpoint` | VC 主权重 `.pth`（相对 service_dir 或绝对路径） |
+| `sing_config` | VC `config_dit_mel_seed_uvit_whisper_small_wavenet.yml` |
+| `sing_ref_path` | 唱歌参考音色，默认小鲸鱼参考音 `demos/小鲸鱼_默认参考_0.85.wav` |
+| `sing_diffusion_steps` | 25（标准），30~50 更高质量但更慢 |
+
+改完保存后**完整重启 AstrBot**（插件重载不重新加载 Python 模块）。
+
+### 3. 使用唱歌
+
+- `/sing <唱歌干声路径>`：用小鲸鱼唱本机干声（wav/mp3）
+- `/sing` + **发送一段音频附件**（语音或文件）：用附件作干声
+- `/sing_status`：查看唱歌服务状态
+- `/sing_restart`：重启唱歌服务（首次模型加载约 1-2 分钟）
+- 可选 `ref=<参考音路径>`：覆盖默认小鲸鱼参考音
+
+唱歌干声建议：**无伴奏人声**（清唱或伴奏分离后的干声），wav，采样率 16k~48k 均可。
+
+---
+
 ## 五、在 DSH (DeepSeek Harness) 中使用
 
 如果你使用的宿主不是 AstrBot，而是 **DeepSeek Harness (DSH)**，无需更换底层服务：

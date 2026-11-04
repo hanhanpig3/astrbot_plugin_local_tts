@@ -53,5 +53,40 @@
     "type": "string",
     "default": "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt",
     "description": "GPT 语义模型相对 GPT-SoVITS/ 目录的路径。"
+  },
+  "sing_enable": {
+    "type": "bool",
+    "default": false,
+    "description": "启用唱歌模式（Seed-VC 音色转换）。默认关闭；开启后 AstrBot 启动时自动拉起唱歌服务。"
+  },
+  "sing_port": {
+    "type": "int",
+    "default": 9882,
+    "description": "唱歌（Seed-VC 音色转换）服务端口。"
+  },
+  "sing_dir": {
+    "type": "string",
+    "default": "/Users/hanhanpig3/Documents/文稿 - hanhanpig3的Mac mini/programe/localtts/sing_lab",
+    "description": "唱歌实验目录（含 seed-vc/ 仓库和 .venv 虚拟环境），Seed-VC 从这里加载模型。"
+  },
+  "sing_checkpoint": {
+    "type": "string",
+    "default": "sing_lab/seed-vc/checkpoints/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth",
+    "description": "Seed-VC VC 主权重 .pth（相对 service_dir 或绝对路径）。"
+  },
+  "sing_config": {
+    "type": "string",
+    "default": "sing_lab/seed-vc/configs/presets/config_dit_mel_seed_uvit_whisper_small_wavenet.yml",
+    "description": "Seed-VC VC config .yml（相对 service_dir 或绝对路径）。"
+  },
+  "sing_ref_path": {
+    "type": "string",
+    "default": "demos/小鲸鱼_默认参考_0.85.wav",
+    "description": "唱歌参考音色（默认小鲸鱼参考音，相对 service_dir 或绝对路径）。"
+  },
+  "sing_diffusion_steps": {
+    "type": "int",
+    "default": 25,
+    "description": "Seed-VC 扩散步数（25 标准，30~50 质量更高更慢）。"
   }
 }
