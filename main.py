@@ -75,7 +75,15 @@ class LocalTtsPlugin(Star):
         return Path(str(self.config.get("sing_dir", "") or "")).expanduser()
 
     def _sing_python(self) -> Path:
-        return self._sing_dir() / ".venv" / "bin" / "python"
+        # Seed-VC 独立环境用 sing_dir/venv (无点, 与 GPT-SoVITS 的 .venv 区分)
+        return self._sing_dir() / "venv" / "bin" / "python"
+
+    def _sing_ready(self) -> bool:
+        """唱歌服务是否可用 (HTTP 探测, 不依赖 _sing_proc)。"""
+        try:
+            return requests.get(f"{self._sing_url()}/health", timeout=2).status_code == 200
+        except Exception:
+            return False
 
     def _resolve_path(self, p: str) -> Path:
         """相对路径相对 service_dir 解析, 绝对路径原样返回。"""
@@ -98,13 +106,17 @@ class LocalTtsPlugin(Star):
         if not bool(self.config.get("sing_enable", False)):
             return
         async with self._proc_lock:
+            # 端口已通 (外部/此前手动启动的服务) 则跳过, 避免重复占用
+            if self._sing_ready():
+                logger.info("local_tts: 唱歌服务已在 9882 可用, 跳过启动")
+                return
             if self._sing_proc and self._sing_proc.poll() is None:
                 logger.info("local_tts: 唱歌服务已在运行, 跳过启动")
                 return
             sing_dir = self._sing_dir()
             py = self._sing_python()
             if not py.exists():
-                logger.error(f"local_tts: 找不到唱歌 .venv 的 python: {py}")
+                logger.error(f"local_tts: 找不到唱歌 venv 的 python: {py}")
                 return
             env = os.environ.copy()
             env["SEEDVC_DIR"] = str(sing_dir / "seed-vc")
@@ -291,7 +303,7 @@ class LocalTtsPlugin(Star):
         if not bool(self.config.get("sing_enable", False)):
             yield event.plain_result("唱歌模式未启用。请先在插件配置里开启 sing_enable 并重启 AstrBot。")
             return
-        if not (self._sing_proc and self._sing_proc.poll() is None):
+        if not self._sing_ready():
             yield event.plain_result("唱歌服务未运行。请使用 /sing_restart 启动 (首次模型加载约 1-2 分钟)。")
             return
 
@@ -370,9 +382,9 @@ class LocalTtsPlugin(Star):
         if not bool(self.config.get("sing_enable", False)):
             yield event.plain_result("唱歌模式未启用 (sing_enable=false)。")
             return
-        st = ("运行中(PID %s)" % self._sing_proc.pid) if (
-            self._sing_proc and self._sing_proc.poll() is None
-        ) else "未运行"
+        st = "可用" if self._sing_ready() else "未运行"
+        if self._sing_proc and self._sing_proc.poll() is None:
+            st += f" (PID {self._sing_proc.pid})"
         ref = self._sing_ref()
         yield event.plain_result(
             f"唱歌(Seed-VC)服务状态\n"
