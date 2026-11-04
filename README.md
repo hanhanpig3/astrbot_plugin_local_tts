@@ -250,20 +250,20 @@ cd ~/localtts/sing_lab
 curl -L -o seed-vc.zip "https://github.com/Plachtaa/seed-vc/archive/refs/heads/main.zip"
 unzip -q seed-vc.zip && mv seed-vc-main seed-vc
 
-# VC 主权重 + config (hf-mirror)
+# SVC 主权重 (f0=True 音调保留) + config (hf-mirror)
 cd seed-vc
-mkdir -p checkpoints models/bigvgan_22k models/whisper-small
-curl -L -o checkpoints/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth \
-  "https://hf-mirror.com/Plachta/Seed-VC/resolve/main/DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned.pth"
-# bigvgan 声码器 + whisper 模型 (hf-mirror)
-curl -L -o models/bigvgan_22k/config.json "https://hf-mirror.com/nvidia/bigvgan_v2_22khz_80band_256x/resolve/main/config.json"
-curl -L -o models/bigvgan_22k/bigvgan_generator.pt "https://hf-mirror.com/nvidia/bigvgan_v2_22khz_80band_256x/resolve/main/bigvgan_generator.pt"
+mkdir -p checkpoints models/bigvgan_44k models/whisper-small
+curl -L -o checkpoints/DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2.pth \
+  "https://hf-mirror.com/Plachta/Seed-VC/resolve/main/DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2.pth"
+# bigvgan 44k 声码器 + whisper-small (hf-mirror)
+curl -L -o models/bigvgan_44k/config.json "https://hf-mirror.com/nvidia/bigvgan_v2_44khz_128band_512x/resolve/main/config.json"
+curl -L -o models/bigvgan_44k/bigvgan_generator.pt "https://hf-mirror.com/nvidia/bigvgan_v2_44khz_128band_512x/resolve/main/bigvgan_generator.pt"
 curl -L -o models/whisper-small/config.json "https://hf-mirror.com/openai/whisper-small/resolve/main/config.json"
 curl -L -o models/whisper-small/model.safetensors "https://hf-mirror.com/openai/whisper-small/resolve/main/model.safetensors"
 curl -L -o models/whisper-small/preprocessor_config.json "https://hf-mirror.com/openai/whisper-small/resolve/main/preprocessor_config.json"
 ```
 
-> 本插件配套的 `seed-vc/inference.py` 与 `config_dit_mel_seed_uvit_whisper_small_wavenet.yml` 已改为**加载本地 `checkpoints/models/` 目录**（绕过 huggingface_hub 直连 HF 被墙）。下载后按上述路径放置即可。
+> 本插件配套的 `seed-vc/inference.py` 与 `config_dit_mel_seed_uvit_whisper_base_f0_44k.yml` 已改为**加载本地 `checkpoints/models/` 目录**（绕过 huggingface_hub 直连 HF 被墙）。下载后按上述路径放置即可。
 
 ### 2. 在 AstrBot 插件配置里启用唱歌
 
@@ -271,8 +271,8 @@ curl -L -o models/whisper-small/preprocessor_config.json "https://hf-mirror.com/
 | --- | --- |
 | `sing_enable` | `true`（默认关闭） |
 | `sing_dir` | 唱歌环境目录，如 `~/localtts/sing_lab` |
-| `sing_checkpoint` | VC 主权重 `.pth`（相对 service_dir 或绝对路径） |
-| `sing_config` | VC `config_dit_mel_seed_uvit_whisper_small_wavenet.yml` |
+| `sing_checkpoint` | SVC 主权重 `DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2.pth` |
+| `sing_config` | SVC `config_dit_mel_seed_uvit_whisper_base_f0_44k.yml`（f0=True 音调保留） |
 | `sing_ref_path` | 唱歌参考音色，默认小鲸鱼参考音 `demos/小鲸鱼_默认参考_0.85.wav` |
 | `sing_diffusion_steps` | 25（标准），30~50 更高质量但更慢 |
 
@@ -280,13 +280,14 @@ curl -L -o models/whisper-small/preprocessor_config.json "https://hf-mirror.com/
 
 ### 3. 使用唱歌
 
-- `/sing <唱歌干声路径>`：用小鲸鱼唱本机干声（wav/mp3）
-- `/sing` + **发送一段音频附件**（语音或文件）：用附件作干声
+- `/sing <唱歌干声路径>`：用小鲸鱼唱本机**干声**（无伴奏人声，wav/mp3），音调=原歌、音色=小鲸鱼
+- `/sing_mix <歌曲路径>`：用小鲸鱼唱**完整歌曲**（自动 demucs 分离人声+伴奏，唱完合成伴奏，输出完整版）
+- `/sing` / `/sing_mix` + **发送一段音频附件**：用附件作输入
 - `/sing_status`：查看唱歌服务状态
 - `/sing_restart`：重启唱歌服务（首次模型加载约 1-2 分钟）
 - 可选 `ref=<参考音路径>`：覆盖默认小鲸鱼参考音
 
-唱歌干声建议：**无伴奏人声**（清唱或伴奏分离后的干声），wav，采样率 16k~48k 均可。
+唱歌干声建议：**无伴奏人声**（清唱或伴奏分离后的干声），wav，采样率 16k~48k 均可。`/sing_mix` 则直接给**带伴奏的完整歌曲**即可。
 
 ---
 
