@@ -11,6 +11,7 @@ AstrBot WebUI 的「GSVI TTS(API)」语音合成源配置 api_base 指向包装�
 """
 import asyncio
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -27,6 +28,18 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 ENGINE_LOG = "/tmp/localtts_engine.log"
 WRAPPER_LOG = "/tmp/localtts_wrapper.log"
 SING_LOG = "/tmp/localtts_sing.log"
+
+# ---------------- 网易云点歌 (点歌并唱出来) 常量 ----------------
+# 参考 astrbot_plugin_netease_pick 的官方直链方案 (免 key 免登录)。
+NETEASE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+NETEASE_ID_RE = re.compile(r"[?&]id=(\d+)")
+NETEASE_LINK_RE = re.compile(r"https?://[^\s\"'<>()（）【】]+")
+NETEASE_OUTER_URL = "http://music.163.com/song/media/outer/url?id={sid}.mp3"
+# 网易云音频体积下限: 真歌至少几百 KB; 错误页 ~104 KB / -460 JSON 83 字节。
+NETEASE_MIN_AUDIO_BYTES = 200 * 1024
 
 
 class LocalTtsPlugin(Star):
@@ -164,7 +177,20 @@ class LocalTtsPlugin(Star):
     def _find_audio_attachments(self, event: AstrMessageEvent) -> list:
         """返回消息里所有音频附件 (语音/文件) 的本地路径或 url。"""
         atts = []
-        for comp in getattr(event, "message", []) or []:
+        # AstrBot 4.29: event.message 已不存在, getattr(event,"message",[]) 恒为 []
+        # 导致 _auto_sing 永远找不到附件而静默返回。改用 get_messages() / message_obj.message。
+        chain = []
+        if hasattr(event, "get_messages"):
+            chain = event.get_messages() or []
+        elif getattr(event, "message_obj", None) is not None:
+            chain = getattr(event.message_obj, "message", []) or []
+        else:
+            chain = (
+                getattr(event, "message_chain", None)
+                or getattr(event, "message", None)
+                or []
+            )
+        for comp in chain:
             if isinstance(comp, Record):
                 v = comp.file or comp.url or ""
                 if v:
@@ -383,7 +409,7 @@ class LocalTtsPlugin(Star):
                 json={
                     "source": source,
                     "target": str(ref_path),
-                    "diffusion_steps": int(self.config.get("sing_diffusion_steps", 25)),
+                    "diffusion_steps": int(self.config.get("sing_diffusion_steps", 6)),
                     "pitch_shift": float(self.config.get("sing_pitch_shift", 2)),
                 },
                 timeout=600,
@@ -472,31 +498,79 @@ class LocalTtsPlugin(Star):
                 yield event.plain_result(f"下载歌曲失败: {e}")
                 return
 
-        yield event.plain_result("🎤 正在用小鲸鱼唱完整歌曲... (分离人声+伴奏+转换, 约需 1-3 分钟)")
+        # 并发防护: 同一时刻只允许一个唱歌任务, 避免多个请求撞车/争抢资源。
+        if getattr(self, "_sing_busy", False):
+            yield event.plain_result("已有唱歌任务进行中, 请等它完成后再试。")
+            return
+        self._sing_busy = True
         try:
-            resp = requests.post(
-                f"{self._sing_url()}/sing_mix",
-                json={
-                    "source": source,
-                    "target": str(ref_path),
-                    "diffusion_steps": int(self.config.get("sing_diffusion_steps", 25)),
-                    "pitch_shift": float(self.config.get("sing_pitch_shift", 2)),
-                },
-                timeout=900,
-            )
-            if resp.status_code != 200:
-                yield event.plain_result(f"唱歌合成失败: HTTP {resp.status_code} {resp.text[:200]}")
-                return
-            out = _tf.NamedTemporaryFile(suffix=".wav", delete=False)
-            out.write(resp.content)
-            out.close()
-            yield event.chain_result([
-                Plain(f"小鲸鱼唱完整歌曲完成: {len(resp.content)//1024}KB"),
-                Record(file=out.name),
-            ])
-        except Exception as e:
-            yield event.plain_result(f"唱歌合成异常: {e}")
+            yield event.plain_result("🎤 正在用小鲸鱼唱完整歌曲... (分离人声+伴奏+转换, 约需 1-3 分钟)")
+            print("[local_tts] 🎤 开始用小鲸鱼唱完整歌曲 (分离人声+伴奏+转换)...", flush=True)
+            # 异步化: POST 放后台线程, 主循环不被卡住; 同时轮询 /progress 把进度实时吐给用户。
+            import threading, queue as _queue
+            _result_q = _queue.Queue()
+            _payload = {
+                "source": source,
+                "target": str(ref_path),
+                "diffusion_steps": int(self.config.get("sing_diffusion_steps", 6)),
+                "pitch_shift": float(self.config.get("sing_pitch_shift", 2)),
+            }
+
+            def _do_sing():
+                try:
+                    resp = requests.post(
+                        f"{self._sing_url()}/sing_mix", json=_payload, timeout=900
+                    )
+                    _result_q.put(("ok", resp))
+                except Exception as e:
+                    _result_q.put(("err", e))
+
+            threading.Thread(target=_do_sing, daemon=True).start()
+            loop = asyncio.get_running_loop()
+            last_stage, last_pct = "", -10
+            kind, val = None, None
+            while True:
+                try:
+                    kind, val = _result_q.get_nowait()
+                    break
+                except _queue.Empty:
+                    pass
+                try:
+                    pr = await loop.run_in_executor(
+                        None,
+                        lambda: requests.get(f"{self._sing_url()}/progress", timeout=2).json(),
+                    )
+                    stage = str(pr.get("stage", ""))
+                    pct = int(pr.get("pct", 0))
+                    detail = str(pr.get("detail", ""))
+                    if stage != last_stage or pct >= last_pct + 5:
+                        msg = f"🎤 [{stage}] {pct}%"
+                        if detail:
+                            msg += f" {detail}"
+                        yield event.plain_result(msg)
+                        print(f"[local_tts] {msg}", flush=True)
+                        last_stage, last_pct = stage, pct
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+
+            if kind == "err":
+                print(f"[local_tts] ❌ 唱歌合成异常: {val}", flush=True)
+                yield event.plain_result(f"唱歌合成异常: {val}")
+            elif val.status_code != 200:
+                print(f"[local_tts] ❌ 唱歌合成失败: HTTP {val.status_code} {val.text[:200]}", flush=True)
+                yield event.plain_result(f"唱歌合成失败: HTTP {val.status_code} {val.text[:200]}")
+            else:
+                out = _tf.NamedTemporaryFile(suffix=".wav", delete=False)
+                out.write(val.content)
+                out.close()
+                print(f"[local_tts] ✅ 小鲸鱼唱完整歌曲完成: {len(val.content)//1024}KB", flush=True)
+                yield event.chain_result([
+                    Plain(f"小鲸鱼唱完整歌曲完成: {len(val.content)//1024}KB"),
+                    Record(file=out.name),
+                ])
         finally:
+            self._sing_busy = False
             for _t in (tmp, ref_tmp):
                 if _t:
                     try:
@@ -504,14 +578,124 @@ class LocalTtsPlugin(Star):
                     except OSError:
                         pass
 
+    @filter.command("点歌")
+    async def dian_ge(self, event: AstrMessageEvent, source_path: str = "", ref: str = ""):
+        """点歌并唱出来: 发网易云链接, 下载后用参考音色唱完整歌曲。
+
+        /点歌 <网易云歌曲链接>    例如 /点歌 https://music.163.com/song?id=3413072220
+                                  或 /点歌 https://163cn.tv/xxxx (QQ 分享短链, 先跟随 302 拿 id)
+        需要 sing_enable=true 且唱歌服务运行 (9882)。走网易云官方直链, 免 key 免登录。
+        """
+        raw = getattr(event, "message_str", "") or ""
+        m = NETEASE_LINK_RE.search(raw)
+        if not m:
+            # 兜底: 从命令参数里拼 (AstrBot 把消息按空格切分, 链接可能在任一 token)
+            candidate = " ".join([source_path, ref])
+            m = NETEASE_LINK_RE.search(candidate)
+        if not m:
+            yield event.plain_result(
+                "用法: /点歌 <网易云歌曲链接>\n"
+                "例如: /点歌 https://music.163.com/song?id=3413072220&userid=xxx\n"
+                "或 /点歌 https://163cn.tv/xxxx (QQ 分享短链)。"
+            )
+            return
+        link = m.group(0).strip()
+        sid = await self._netease_resolve_id(link)
+        if not sid:
+            yield event.plain_result(
+                "无法从该链接解析到网易云歌曲 id。请发完整链接 (含 ?id= 或 163cn.tv 短链)。"
+            )
+            return
+        yield event.plain_result(f"🎵 点歌: 歌曲 id={sid}, 正在下载并准备用小鲸鱼唱...")
+        print(f"[local_tts] 🎵 点歌: 歌曲 id={sid} 链接={link}, 下载+唱歌中...", flush=True)
+        mp3_path = None
+        try:
+            mp3_path = await self._netease_download(sid)
+        except Exception as e:
+            yield event.plain_result(f"下载歌曲失败: {e}")
+            return
+        try:
+            async for r in self._sing_mix_impl(event, mp3_path, ""):
+                yield r
+        finally:
+            try:
+                if mp3_path:
+                    os.unlink(mp3_path)
+            except OSError:
+                pass
+
+    async def _netease_resolve_id(self, link: str):
+        """从网易云链接解析歌曲 ID。支持 ?id= 直链 与 163cn.tv 短链(跟随 302, aiohttp 同 netease_pick)。"""
+        link = (link or "").strip()
+        if not link:
+            return None
+        m = NETEASE_ID_RE.search(link)
+        if m:
+            return m.group(1)
+        if "163cn.tv" in link:
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(
+                        link,
+                        headers={"User-Agent": NETEASE_UA},
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as r:
+                        m = NETEASE_ID_RE.search(str(r.url))
+                        if m:
+                            return m.group(1)
+            except Exception as e:
+                logger.warning(f"[local_tts] 网易云短链解析失败: {e}")
+        return None
+
+    async def _netease_download(self, song_id: str):
+        """下载网易云歌曲为临时 mp3 (aiohttp, 同 netease_pick)。
+
+        三判据校验 (netease_pick 踩过的坑): Content-Type 是 audio/*、
+        最终 URL 落到 music.126.net CDN、体积 >= 200KB。否则多半是版权受限/VIP。
+        """
+        import aiohttp
+        import tempfile as _tf
+        url = NETEASE_OUTER_URL.format(sid=song_id)
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(
+                url,
+                headers={"User-Agent": NETEASE_UA},
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                ctype = str(resp.headers.get("Content-Type", "") or "")
+                final = str(resp.url)
+                data = await resp.read()
+        if not ctype.startswith("audio/"):
+            raise RuntimeError(f"网易云没给音频 (Content-Type={ctype or '未知'})")
+        if "music.126.net" not in final:
+            raise RuntimeError("没跳到网易云 CDN (music.126.net), 多半是版权受限/VIP 或链接失效")
+        if len(data) < NETEASE_MIN_AUDIO_BYTES:
+            raise RuntimeError(f"音频过小 ({len(data)} 字节)")
+        f = _tf.NamedTemporaryFile(suffix=".mp3", delete=False)
+        f.write(data)
+        f.close()
+        return f.name
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def _auto_sing(self, event: AstrMessageEvent):
-        """自动唱歌: 收到音频附件(无命令) -> 自动唱完整歌曲 (可用 sing_auto=false 关闭)。"""
+        """自动唱歌: 私聊收到音频附件(无命令) -> 自动唱完整歌曲 (可用 sing_auto=false 关闭)。
+
+        边缘控制: 只对【私聊】消息自动唱歌。群聊里任何人的语音(含其他 bot 如 Molly)
+        都可能触发, 导致误克隆别人音色 + 与你自己的任务撞车; 群聊请用 /sing_mix 手动触发。
+        """
         if not bool(self.config.get("sing_auto", True)):
             return
         if not bool(self.config.get("sing_enable", False)):
             return
         if not self._sing_ready():
+            return
+        # 边缘控制: 仅私聊自动唱歌; 群聊语音(其他 bot / 他人)一律不触发。
+        try:
+            if not event.is_private_chat():
+                return
+        except Exception:
             return
         # 跳过命令消息 (命令由 command handler 处理, 避免双触发)
         msg = getattr(event, "message_str", "") or ""

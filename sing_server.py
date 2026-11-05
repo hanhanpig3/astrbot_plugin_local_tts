@@ -59,10 +59,32 @@ OVERLAP_FRAME = 16
 OVERLAP_WAVE = OVERLAP_FRAME * HOP
 _convert_lock = threading.Lock()
 
+# ---- 进度追踪 (供 /progress 轮询, 让插件把唱歌进度实时吐给用户) ----
+PROGRESS = {"stage": "空闲", "pct": 0, "detail": "", "t0": time.time()}
+_progress_lock = threading.Lock()
+
+
+def _set_progress(stage: str, pct: int, detail: str = ""):
+    with _progress_lock:
+        PROGRESS["stage"] = stage
+        PROGRESS["pct"] = max(0, min(100, int(pct)))
+        PROGRESS["detail"] = detail
+        PROGRESS["t0"] = time.time()
+
+
+def _get_progress():
+    with _progress_lock:
+        return dict(PROGRESS)
+
 
 @torch.no_grad()
-def convert(source, target, diffusion_steps=25, length_adjust=1.0, inference_cfg_rate=0.7):
-    """Seed-VC SVC 转换: source 干声 -> target 参考音色。返回 (wave float32 numpy, sr)。"""
+def convert(source, target, diffusion_steps=25, length_adjust=1.0, inference_cfg_rate=0.7, pitch_shift=0.0,
+            progress_base=0, progress_span=100):
+    """Seed-VC SVC 转换: source 干声 -> target 参考音色。pitch_shift>0 移高音调(女声化)。返回 (wave, sr)。
+
+    progress_base/progress_span: 把本函数的进度映射到全局 [base, base+span] 区间。
+    """
+    _set_progress("音色转换", progress_base, "加载音频...")
     with _convert_lock:
         source_audio = librosa.load(source, sr=SR)[0]
         ref_audio = librosa.load(target, sr=SR)[0]
@@ -108,7 +130,8 @@ def convert(source, target, diffusion_steps=25, length_adjust=1.0, inference_cfg
         F0_alt = F0FN(converted_waves_16k[0], thred=0.03)
         F0_ori = torch.from_numpy(F0_ori).float().to(DEVICE)[None]
         F0_alt = torch.from_numpy(F0_alt).float().to(DEVICE)[None]
-        shifted_f0_alt = F0_alt  # 保留源 F0, 音调 = 原歌音高
+        # 保留源 F0 (音调=原歌), 可选 pitch_shift 上移(女声化)
+        shifted_f0_alt = F0_alt * (2 ** (pitch_shift / 12.0)) if pitch_shift else F0_alt
 
         cond, _, _, _, _ = MODEL.length_regulator(S_alt, ylens=target_lengths, n_quantizers=3, f0=shifted_f0_alt)
         prompt_condition, _, _, _, _ = MODEL.length_regulator(S_ori, ylens=target2_lengths, n_quantizers=3, f0=F0_ori)
@@ -116,7 +139,13 @@ def convert(source, target, diffusion_steps=25, length_adjust=1.0, inference_cfg
         max_source_window = MAX_CTX - mel2.size(2)
         processed_frames = 0
         generated_wave_chunks = []
+        _total_frames = cond.size(1)
         while processed_frames < cond.size(1):
+            _set_progress(
+                "音色转换",
+                progress_base + int(processed_frames / max(_total_frames, 1) * progress_span),
+                f"转换中 {processed_frames}/{_total_frames} 帧",
+            )
             chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
             is_last_chunk = processed_frames + max_source_window >= cond.size(1)
             cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
@@ -161,10 +190,10 @@ def _demucs_vocals_and_accompaniment(audio_path: str, workdir: str):
     """demucs 分离人声+伴奏。返回 (vocals_path, accompaniment_path)。"""
     out_dir = os.path.join(workdir, "demucs")
     os.makedirs(out_dir, exist_ok=True)
-    # demucs 用本 venv python (已装 demucs)
+    # demucs 用本 venv python (已装 demucs); -d mps 用 Apple GPU 加速 (M4 上接近实时)
     cmd = [
         sys.executable, "-m", "demucs.separate", "-n", "htdemucs",
-        "--two-stems=vocals", "-o", out_dir, audio_path,
+        "--two-stems=vocals", "-o", out_dir, "-d", "mps", audio_path,
     ]
     subprocess.run(cmd, check=True, capture_output=True, timeout=1800)
     base = os.path.splitext(os.path.basename(audio_path))[0]
@@ -197,14 +226,19 @@ def sf_write(path, data, sr):
 def convert_and_mix(source, target, diffusion_steps=25, length_adjust=1.0, inference_cfg_rate=0.7,
                     vocal_gain=1.0, acc_gain=0.85):
     """完整流程: demucs 分离 -> SVC 转小鲸鱼 -> 混合伴奏。返回 (out_wav_path, sr)。"""
+    _set_progress("分离人声+伴奏", 5, "demucs 分离中 (约1-2分钟)...")
     with tempfile.TemporaryDirectory() as workdir:
         vocals_path, acc_path = _demucs_vocals_and_accompaniment(source, workdir)
-        wave, sr = convert(vocals_path, target, diffusion_steps, length_adjust, inference_cfg_rate)
+        _set_progress("分离人声+伴奏", 20, "demucs 完成")
+        wave, sr = convert(vocals_path, target, diffusion_steps, length_adjust, inference_cfg_rate,
+                           progress_base=20, progress_span=70)
+        _set_progress("混合伴奏", 92, "混合中...")
         whale_wav = os.path.join(workdir, "whale.wav")
         import soundfile as _sf
         _sf.write(whale_wav, wave, sr)
         out_wav = os.path.join(workdir, "full.wav")
         _mix(whale_wav, acc_path, out_wav, vocal_gain, acc_gain)
+        _set_progress("完成", 100, "")
         with open(out_wav, "rb") as f:
             data = f.read()
         return data, sr
@@ -222,6 +256,13 @@ class SingHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/progress"):
+            body = json.dumps(_get_progress()).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_error(404)
 
@@ -233,30 +274,45 @@ class SingHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "audio/wav")
         self.send_header("Content-Length", str(len(wav_bytes)))
+        self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(wav_bytes)
+        # 分块写, 避免大 WAV 单次 write 触发 BrokenPipe
+        CHUNK = 1024 * 1024
+        for i in range(0, len(wav_bytes), CHUNK):
+            self.wfile.write(wav_bytes[i:i + CHUNK])
+        try:
+            self.wfile.flush()
+        except BrokenPipeError:
+            pass
 
     def _send_error(self, e):
         import traceback
         traceback.print_exc()
-        self.send_response(500)
-        self.send_header("Content-Type", "application/json")
-        body = json.dumps({"error": str(e)}).encode()
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            body = json.dumps({"error": str(e)}).encode()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
 
     def do_POST(self):
         try:
-            if self.path.startswith("/sing"):
+            # 精确匹配 /sing, 否则 /sing_mix 会被 startswith("/sing") 截走
+            if self.path == "/sing":
                 data = self._read_json()
                 source = data["source"]
                 target = data["target"]
                 diffusion_steps = int(data.get("diffusion_steps", 25))
                 length_adjust = float(data.get("length_adjust", 1.0))
                 cfg_rate = float(data.get("inference_cfg_rate", 0.7))
+                pitch_shift = float(data.get("pitch_shift", 0.0))
                 t0 = time.time()
-                wave, sr = convert(source, target, diffusion_steps, length_adjust, cfg_rate)
+                _set_progress("音色转换", 0, "开始...")
+                wave, sr = convert(source, target, diffusion_steps, length_adjust, cfg_rate, pitch_shift)
+                _set_progress("完成", 100, "")
                 import io
                 buf = io.BytesIO()
                 torchaudio.save(buf, torch.from_numpy(wave).unsqueeze(0), sr, format="wav")
@@ -271,6 +327,7 @@ class SingHandler(BaseHTTPRequestHandler):
                 length_adjust = float(data.get("length_adjust", 1.0))
                 cfg_rate = float(data.get("inference_cfg_rate", 0.7))
                 t0 = time.time()
+                _set_progress("准备", 1, "接收歌曲...")
                 wav_bytes, sr = convert_and_mix(source, target, diffusion_steps, length_adjust, cfg_rate)
                 print(f"[sing] /sing_mix 完成 {time.time()-t0:.1f}s (demucs+SVC+mix)", flush=True)
                 self._send_wav(wav_bytes)

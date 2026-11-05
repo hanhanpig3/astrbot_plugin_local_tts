@@ -240,6 +240,8 @@ python3.10 -m venv venv
   "descript-audio-codec==1.0.0" "pydub==0.25.1" "resemblyzer" "jiwer==3.0.3" \
   "transformers==4.46.3" "soundfile==0.12.1" "hydra-core==1.3.2" "pyyaml" \
   "python-dotenv" "accelerate"
+# /sing_mix 完整歌曲分离人声+伴奏需要 demucs
+./venv/bin/pip install "demucs==4.1.0"
 ```
 
 下载 Seed-VC 源码 + 权重（国内走 hf-mirror.com）：
@@ -269,18 +271,22 @@ curl -L -o models/whisper-small/preprocessor_config.json "https://hf-mirror.com/
 
 | 配置项 | 说明 |
 | --- | --- |
-| `sing_enable` | `true`（默认关闭） |
+| `sing_enable` | `true` 启用唱歌（默认关闭） |
+| `sing_auto` | `true` 时**私聊**转发音频自动唱歌；**群聊不自动触发**（避免误把群里别人/其他机器人的语音当成输入、误克隆他人音色） |
+| `sing_port` | 唱歌服务端口，默认 `9882`（保持默认） |
 | `sing_dir` | 唱歌环境目录，如 `~/localtts/sing_lab` |
 | `sing_checkpoint` | SVC 主权重 `DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2.pth` |
 | `sing_config` | SVC `config_dit_mel_seed_uvit_whisper_base_f0_44k.yml`（f0=True 音调保留） |
 | `sing_ref_path` | 唱歌参考音色，默认小鲸鱼参考音 `demos/小鲸鱼_默认参考_0.85.wav` |
-| `sing_diffusion_steps` | 25（标准），30~50 更高质量但更慢 |
+| `sing_diffusion_steps` | 扩散步数，默认 `6`（M4 上接近实时）；`10` 音质更好；`3` 更快但音质下降 |
 | `sing_pitch_shift` | 音高上移半音数，默认 `2`（女声化更明亮；0=原调，可调 -3~+5） |
 
 改完保存后**完整重启 AstrBot**（插件重载不重新加载 Python 模块）。
 
 ### 3. 使用唱歌
 
+**命令：**
+- `/点歌 <网易云链接>`：点歌并唱出来——自动从网易云下载歌曲（仅限**非 VIP/版权免费歌**，如 `https://music.163.com/song?id=xxxx` 或 QQ 分享短链 `163cn.tv/xxxx`），再用参考音色唱完整歌曲
 - `/sing <唱歌干声路径>`：用小鲸鱼唱本机**干声**（无伴奏人声，wav/mp3），音调=原歌、音色=参考音
 - `/sing_mix <歌曲路径>`：用小鲸鱼唱**完整歌曲**（自动 demucs 分离人声+伴奏，唱完合成伴奏，输出完整版）
 - `/sing` / `/sing_mix` + **发送一段音频附件**：用附件作输入
@@ -289,7 +295,18 @@ curl -L -o models/whisper-small/preprocessor_config.json "https://hf-mirror.com/
 - `/sing_restart`：重启唱歌服务（首次模型加载约 1-2 分钟）
 - 可选 `ref=<参考音路径或URL>`：覆盖默认小鲸鱼参考音（本机路径或 http 文件链接）
 
+**自动唱歌：** `sing_auto=true` 时，**私聊**里发送/转发一段音频会自动用小鲸鱼唱；**群聊不会自动触发**（避免把群里别人/其他机器人的语音当成输入、误克隆他人音色）。同一时刻只允许一个唱歌任务，重复触发会提示「已有唱歌任务进行中」。
+
+**进度与日志：** 唱歌是**异步**的，不卡机器人其他消息；每 3 秒轮询进度，在**聊天**和**插件终端（`[local_tts]` 前缀）**里实时输出，如 `🎤 [音色转换] 45%`、`🎤 [分离人声+伴奏] 20%`。完成后聊天直接返回语音附件。
+
 唱歌干声建议：**无伴奏人声**（清唱或伴奏分离后的干声），wav，采样率 16k~48k 均可。`/sing_mix` 则直接给**带伴奏的完整歌曲**即可。
+
+### 4. 性能与加速（Apple Silicon M4 实测）
+
+- **MPS 加速**：`sing_server.py` 里 demucs 分离用 `-d mps`（Apple GPU），Seed-VC 主模型 `device=mps`，无需手动配置。
+- **扩散步数**：`sing_diffusion_steps=6`（默认）在 M4 上把一首 3.5 分钟歌从约 8.4 分钟（25 步 + CPU demucs）降到约 4 分钟（≈1.15× 实时）。
+- **想更快**：降到 `sing_diffusion_steps=3` 可到约 3.3 分钟（**< 音频时长**），但音质下降；想更好音质升到 `10`。
+- **瓶颈说明**：Seed-VC 的 whisper 语义编码是固定 ~0.8× 实时的墙，无法靠降步数消除（由模型本身决定）。
 
 ---
 
