@@ -275,17 +275,19 @@ curl -L -o models/whisper-small/preprocessor_config.json "https://hf-mirror.com/
 | `sing_config` | SVC `config_dit_mel_seed_uvit_whisper_base_f0_44k.yml`（f0=True 音调保留） |
 | `sing_ref_path` | 唱歌参考音色，默认小鲸鱼参考音 `demos/小鲸鱼_默认参考_0.85.wav` |
 | `sing_diffusion_steps` | 25（标准），30~50 更高质量但更慢 |
+| `sing_pitch_shift` | 音高上移半音数，默认 `2`（女声化更明亮；0=原调，可调 -3~+5） |
 
 改完保存后**完整重启 AstrBot**（插件重载不重新加载 Python 模块）。
 
 ### 3. 使用唱歌
 
-- `/sing <唱歌干声路径>`：用小鲸鱼唱本机**干声**（无伴奏人声，wav/mp3），音调=原歌、音色=小鲸鱼
+- `/sing <唱歌干声路径>`：用小鲸鱼唱本机**干声**（无伴奏人声，wav/mp3），音调=原歌、音色=参考音
 - `/sing_mix <歌曲路径>`：用小鲸鱼唱**完整歌曲**（自动 demucs 分离人声+伴奏，唱完合成伴奏，输出完整版）
 - `/sing` / `/sing_mix` + **发送一段音频附件**：用附件作输入
+- `/sing` / `/sing_mix` + **发送两个音频附件**：第一个作输入（干声/歌曲），第二个作**参考音色**（改音色）
 - `/sing_status`：查看唱歌服务状态
 - `/sing_restart`：重启唱歌服务（首次模型加载约 1-2 分钟）
-- 可选 `ref=<参考音路径>`：覆盖默认小鲸鱼参考音
+- 可选 `ref=<参考音路径或URL>`：覆盖默认小鲸鱼参考音（本机路径或 http 文件链接）
 
 唱歌干声建议：**无伴奏人声**（清唱或伴奏分离后的干声），wav，采样率 16k~48k 均可。`/sing_mix` 则直接给**带伴奏的完整歌曲**即可。
 
