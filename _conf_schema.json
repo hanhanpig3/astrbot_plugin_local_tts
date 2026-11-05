@@ -86,8 +86,8 @@
   },
   "sing_diffusion_steps": {
     "type": "int",
-    "default": 25,
-    "description": "Seed-VC 扩散步数（25 标准，30~50 质量更高更慢）。"
+    "default": 6,
+    "description": "Seed-VC 扩散步数（6 推荐：M4 上接近实时；10 音质更好；3 更快但音质下降）。"
   },
   "sing_pitch_shift": {
     "type": "float",
@@ -97,6 +97,6 @@
   "sing_auto": {
     "type": "bool",
     "default": true,
-    "description": "自动唱歌: 收到音频附件(无命令)自动唱完整歌曲; false=只用手动 /sing /sing_mix"
+    "description": "自动唱歌: 私聊收到音频附件(无命令)自动唱完整歌曲；群聊不自动触发（避免误把群里语音当成输入、误克隆他人音色）。false=只用手动 /sing /sing_mix /点歌"
   }
 }
