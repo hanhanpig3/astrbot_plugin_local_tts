@@ -410,6 +410,7 @@ class LocalTtsPlugin(Star):
                         pass
 
     @filter.command("sing_mix")
+    @filter.command("sing_mix")
     async def sing_mix(self, event: AstrMessageEvent, source_path: str = "", ref: str = ""):
         """唱歌+伴奏: 用参考音色唱完整歌曲 (自动 demucs 分离人声+伴奏, 合成完整版)。
 
@@ -417,6 +418,11 @@ class LocalTtsPlugin(Star):
         /sing_mix                   附带音频附件作为完整歌曲; 两个附件时第二个作参考音
         可选: ref=<参考音路径/URL>  覆盖参考音色 (本机路径或 http 文件链接)
         """
+        async for r in self._sing_mix_impl(event, source_path, ref):
+            yield r
+
+    async def _sing_mix_impl(self, event: AstrMessageEvent, source_path: str = "", ref: str = ""):
+        """完整歌曲唱歌核心逻辑 (供 /sing_mix 命令与自动唱歌复用)。"""
         if not bool(self.config.get("sing_enable", False)):
             yield event.plain_result("唱歌模式未启用。请先在插件配置里开启 sing_enable 并重启 AstrBot。")
             return
@@ -498,6 +504,25 @@ class LocalTtsPlugin(Star):
                         os.unlink(_t)
                     except OSError:
                         pass
+
+    @filter.event_message()
+    async def _auto_sing(self, event: AstrMessageEvent):
+        """自动唱歌: 收到音频附件(无命令) -> 自动唱完整歌曲 (可用 sing_auto=false 关闭)。"""
+        if not bool(self.config.get("sing_auto", True)):
+            return
+        if not bool(self.config.get("sing_enable", False)):
+            return
+        if not self._sing_ready():
+            return
+        # 跳过命令消息 (命令由 command handler 处理, 避免双触发)
+        msg = getattr(event, "message_str", "") or ""
+        if msg.strip().startswith("/"):
+            return
+        atts = self._find_audio_attachments(event)
+        if not atts:
+            return
+        async for r in self._sing_mix_impl(event, "", ""):
+            yield r
 
     @filter.command("sing_status")
     async def sing_status(self, event: AstrMessageEvent):

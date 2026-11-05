@@ -93,5 +93,10 @@
     "type": "float",
     "default": 2,
     "description": "唱歌音高上移半音数 (0=原调, 2=女声化更明亮; 可调 -3~+5)"
+  },
+  "sing_auto": {
+    "type": "bool",
+    "default": true,
+    "description": "自动唱歌: 收到音频附件(无命令)自动唱完整歌曲; false=只用手动 /sing /sing_mix"
   }
 }
