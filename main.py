@@ -410,7 +410,6 @@ class LocalTtsPlugin(Star):
                         pass
 
     @filter.command("sing_mix")
-    @filter.command("sing_mix")
     async def sing_mix(self, event: AstrMessageEvent, source_path: str = "", ref: str = ""):
         """唱歌+伴奏: 用参考音色唱完整歌曲 (自动 demucs 分离人声+伴奏, 合成完整版)。
 
@@ -505,7 +504,7 @@ class LocalTtsPlugin(Star):
                     except OSError:
                         pass
 
-    @filter.event_message()
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def _auto_sing(self, event: AstrMessageEvent):
         """自动唱歌: 收到音频附件(无命令) -> 自动唱完整歌曲 (可用 sing_auto=false 关闭)。"""
         if not bool(self.config.get("sing_auto", True)):
