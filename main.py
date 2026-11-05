@@ -10,6 +10,7 @@ AstrBot 本地 GPT-SoVITS 调音 TTS 插件
 AstrBot WebUI 的「GSVI TTS(API)」语音合成源配置 api_base 指向包装服务地址即可。
 """
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -103,6 +104,47 @@ class SingSongTool(FunctionTool[AstrAgentContext]):
             yield r
 
 
+@dataclass
+class SearchSongTool(FunctionTool[AstrAgentContext]):
+    """LLM 工具: 按歌名在网易云 + B站 搜索歌曲候选 (点歌前的找歌环节)。
+
+    call() 返回候选列表 JSON: [{platform, title, artist, id, url}, ...]。
+    大模型把候选发给用户确认, 用户选定后再调 sing_song。
+    """
+
+    __pydantic_config__ = {"arbitrary_types_allowed": True}
+
+    plugin: Any = None
+    name: str = "search_song"
+    description: str = (
+        "按歌名(或 歌名+歌手)在网易云和B站搜索歌曲, 返回候选列表(平台/标题/歌手/链接)。"
+        "用户想唱歌但没给链接时用; 把候选展示给用户确认, 选定后调用 sing_song。"
+    )
+    parameters: dict[str, Any] = field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "keyword": {
+                    "type": "string",
+                    "description": "歌名或 歌名+歌手, 例如: 晴天 周杰伦",
+                },
+            },
+            "required": ["keyword"],
+        }
+    )
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], keyword: str = ""):
+        if self.plugin is None:
+            yield "search_song 插件未初始化。"
+            return
+        try:
+            cands = await self.plugin._search_song(keyword)
+        except Exception as e:
+            yield f"搜索失败: {e}"
+            return
+        yield json.dumps(cands, ensure_ascii=False)
+
+
 class LocalTtsPlugin(Star):
     """随 AstrBot 启停本地 GPT-SoVITS 调音 TTS 服务。"""
 
@@ -117,11 +159,13 @@ class LocalTtsPlugin(Star):
         self._llm_tool_task = asyncio.create_task(self._defer_register_llm_tool())
 
     async def _defer_register_llm_tool(self):
-        """后台重试注册 sing_song LLM 工具 (等 provider_manager 就绪)。"""
+        """后台重试注册 sing_song / search_song LLM 工具 (等 provider_manager 就绪)。"""
         for attempt in range(10):
             try:
-                self.context.add_llm_tools(SingSongTool(plugin=self))
-                print("[local_tts] 🔧 唱歌已注册为 LLM 工具: sing_song", flush=True)
+                self.context.add_llm_tools(
+                    SingSongTool(plugin=self), SearchSongTool(plugin=self)
+                )
+                print("[local_tts] 🔧 唱歌已注册为 LLM 工具: sing_song / search_song", flush=True)
                 return
             except Exception as e:
                 if attempt == 9:
@@ -691,6 +735,11 @@ class LocalTtsPlugin(Star):
                     Plain(f"小鲸鱼唱完整歌曲完成: {len(val.content)//1024}KB"),
                     Record(file=out.name),
                 ])
+                # 延迟删除输出音频, 避免堆积占用存储 (发送完成后清理)
+                try:
+                    asyncio.get_running_loop().call_later(60, self._safe_unlink, out.name)
+                except Exception:
+                    pass
         finally:
             self._sing_busy = False
             for _t in (tmp, ref_tmp):
@@ -699,6 +748,15 @@ class LocalTtsPlugin(Star):
                         os.unlink(_t)
                     except OSError:
                         pass
+
+    def _safe_unlink(self, path):
+        """尽力删除文件 (清理唱歌输出, 避免堆积占用存储)。"""
+        try:
+            if path and os.path.exists(path):
+                os.unlink(path)
+                print(f"[local_tts] 🗑️ 已清理唱歌输出: {path}", flush=True)
+        except OSError:
+            pass
 
     @filter.command("点歌")
     async def dian_ge(self, event: AstrMessageEvent, source_path: str = "", ref: str = ""):
@@ -885,6 +943,100 @@ class LocalTtsPlugin(Star):
             raise RuntimeError(f"B站音频转码失败: {err.decode(errors='ignore')[:200]}")
         print(f"[local_tts] 🅱️ B站音频就绪: {title} ({len(data)//1024}KB -> wav)", flush=True)
         return wav.name
+
+    # ---------------- 搜歌 (网易云 + B站) ----------------
+    async def _netease_search(self, keyword: str):
+        """网易云按歌名搜索候选。返回 [{platform,title,artist,id,url}, ...]。
+        免登录: 先访问主站拿 session cookie, 再调 api/search/get (text/plain 但内容是 JSON)。
+        """
+        import aiohttp
+        kw = (keyword or "").strip()
+        if not kw:
+            return []
+        out = []
+        try:
+            async with aiohttp.ClientSession(
+                headers={"User-Agent": NETEASE_UA, "Referer": "https://music.163.com/"}
+            ) as sess:
+                try:
+                    async with sess.get("https://music.163.com/", timeout=aiohttp.ClientTimeout(total=8)) as _r:
+                        await _r.read()
+                except Exception:
+                    pass
+                async with sess.get(
+                    "https://music.163.com/api/search/get",
+                    params={"s": kw, "type": 1, "limit": 6, "offset": 0},
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as r:
+                    txt = await r.text()
+            j = json.loads(txt)
+        except Exception as e:
+            print(f"[local_tts] ⚠️ 网易云搜索失败: {type(e).__name__} {e}", flush=True)
+            return []
+        for so in (j.get("result") or {}).get("songs", [])[:6]:
+            sid = so.get("id")
+            if not sid:
+                continue
+            artists = " / ".join(a.get("name", "") for a in so.get("artists", []) if a.get("name"))
+            out.append(
+                {
+                    "platform": "netease",
+                    "title": so.get("name", ""),
+                    "artist": artists,
+                    "id": str(sid),
+                    "url": f"https://music.163.com/song?id={sid}",
+                }
+            )
+        return out
+
+    async def _bilibili_search(self, keyword: str):
+        """B站按关键词搜索视频。返回 [{platform,title,artist,id,url}, ...]。"""
+        import aiohttp
+        kw = (keyword or "").strip()
+        if not kw:
+            return []
+        out = []
+        try:
+            async with aiohttp.ClientSession(
+                headers={"User-Agent": BILI_UA, "Referer": BILI_REFERER}
+            ) as sess:
+                try:
+                    async with sess.get(BILI_REFERER, timeout=aiohttp.ClientTimeout(total=8)) as _r:
+                        await _r.read()
+                except Exception:
+                    pass
+                async with sess.get(
+                    "https://api.bilibili.com/x/web-interface/search/type",
+                    params={"search_type": "video", "keyword": kw, "page": 1},
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as r:
+                    j = await r.json()
+        except Exception as e:
+            print(f"[local_tts] ⚠️ B站搜索失败: {type(e).__name__} {e}", flush=True)
+            return []
+        for v in ((j.get("data") or {}).get("result", []) or [])[:6]:
+            bvid = v.get("bvid")
+            if not bvid:
+                continue
+            title = re.sub(r"<[^>]+>", "", v.get("title", ""))
+            out.append(
+                {
+                    "platform": "bilibili",
+                    "title": title,
+                    "artist": v.get("author", ""),
+                    "id": bvid,
+                    "url": f"https://www.bilibili.com/video/{bvid}",
+                }
+            )
+        return out
+
+    async def _search_song(self, keyword: str):
+        """网易云 + B站 双平台搜歌, 返回候选列表 (网易云优先, 再 B站)。"""
+        ne, bi = await asyncio.gather(
+            self._netease_search(keyword), self._bilibili_search(keyword)
+        )
+        print(f"[local_tts] 🔍 搜歌 '{keyword}': 网易云 {len(ne)} 条, B站 {len(bi)} 条", flush=True)
+        return ne + bi
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def _auto_sing(self, event: AstrMessageEvent):
