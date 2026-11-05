@@ -88,5 +88,10 @@
     "type": "int",
     "default": 25,
     "description": "Seed-VC 扩散步数（25 标准，30~50 质量更高更慢）。"
+  },
+  "sing_pitch_shift": {
+    "type": "number",
+    "default": 2,
+    "description": "唱歌音高上移半音数 (0=原调, 2=女声化更明亮; 可调 -3~+5)"
   }
 }

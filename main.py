@@ -161,6 +161,30 @@ class LocalTtsPlugin(Star):
                 return comp.file_ or comp.url or ""
         return None
 
+    def _find_audio_attachments(self, event: AstrMessageEvent) -> list:
+        """返回消息里所有音频附件 (语音/文件) 的本地路径或 url。"""
+        atts = []
+        for comp in getattr(event, "message", []) or []:
+            if isinstance(comp, Record):
+                v = comp.file or comp.url or ""
+                if v:
+                    atts.append(v)
+            if isinstance(comp, File):
+                v = comp.file_ or comp.url or ""
+                if v:
+                    atts.append(v)
+        return atts
+
+    def _download_temp(self, url: str, suffix: str = ".wav"):
+        """下载 url 到临时文件, 返回 (tmp_path, tmp_file)。"""
+        import tempfile as _tf
+        r = requests.get(url, timeout=180)
+        r.raise_for_status()
+        tmp = _tf.NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp.write(r.content)
+        tmp.close()
+        return tmp.name, tmp
+
     # ---------------- 启停服务 ----------------
     async def _start_service(self) -> None:
         async with self._proc_lock:
@@ -294,11 +318,11 @@ class LocalTtsPlugin(Star):
     # ---------------- 唱歌命令 ----------------
     @filter.command("sing")
     async def sing(self, event: AstrMessageEvent, source_path: str = "", ref: str = ""):
-        """唱歌: 用小鲸鱼(参考音色)唱用户提供的干声。
+        """唱歌: 用参考音色(默认小鲸鱼, 或 ref/第二个附件)唱用户提供的干声。
 
         /sing <干声路径>            干声是本机 wav/mp3 路径
-        /sing                       附带音频附件 (语音或文件) 作为干声
-        可选: ref=<参考音路径>      覆盖默认参考音色 (小鲸鱼)
+        /sing                       附带音频附件作为干声; 若消息带两个附件, 第二个作参考音
+        可选: ref=<参考音路径/URL>  覆盖参考音色 (本机路径或 http 文件链接)
         """
         if not bool(self.config.get("sing_enable", False)):
             yield event.plain_result("唱歌模式未启用。请先在插件配置里开启 sing_enable 并重启 AstrBot。")
@@ -307,41 +331,47 @@ class LocalTtsPlugin(Star):
             yield event.plain_result("唱歌服务未运行。请使用 /sing_restart 启动 (首次模型加载约 1-2 分钟)。")
             return
 
+        atts = self._find_audio_attachments(event)
         source = (source_path or "").strip()
-        if not source:
-            # 尝试取消息里的音频附件
-            att = self._find_audio_attachment(event)
-            if att:
-                source = att
+        if not source and atts:
+            source = atts[0]
         if not source:
             yield event.plain_result(
-                "请提供唱歌干声：/sing <本机 wav/mp3 路径>，或直接发送一段音频附件。\n"
-                "可选 ref=<参考音路径> 覆盖默认小鲸鱼参考音。"
+                "请提供唱歌干声：/sing <本机 wav/mp3 路径>，或直接发送音频附件。\n"
+                "可选 ref=<参考音路径/URL> 覆盖默认小鲸鱼参考音；发两个附件时第二个作参考音。"
             )
             return
 
-        # 参考音: 显式 ref 参数 > 配置默认 (ref= 前缀可能有)
+        # 参考音: 显式 ref 参数 > 第二个附件 > 配置默认
         ref_path = self._sing_ref()
+        ref_tmp = None
+        ref_val = ""
         if ref:
-            ref = ref.strip()
-            if ref.startswith("ref="):
-                ref = ref[len("ref="):].strip()
-            ref_path = self._resolve_path(ref)
+            ref_val = ref.strip()
+            if ref_val.startswith("ref="):
+                ref_val = ref_val[len("ref="):].strip()
+        elif len(atts) > 1:
+            ref_val = atts[1]
+        if ref_val:
+            if str(ref_val).startswith("http"):
+                try:
+                    _, ref_tmp = self._download_temp(ref_val)
+                    ref_path = Path(ref_tmp.name)
+                except Exception as e:
+                    yield event.plain_result(f"下载参考音失败: {e}")
+                    return
+            else:
+                ref_path = self._resolve_path(ref_val)
         if not ref_path.exists():
             yield event.plain_result(f"参考音不存在: {ref_path}")
             return
 
-        # 若 source 是 http url, 下载到临时文件
+        # 若干声是 http url, 下载到临时文件
         import tempfile as _tf
         tmp = None
         if str(source).startswith("http"):
             try:
-                r = requests.get(source, timeout=120)
-                r.raise_for_status()
-                tmp = _tf.NamedTemporaryFile(suffix=".wav", delete=False)
-                tmp.write(r.content)
-                tmp.close()
-                source = tmp.name
+                source, tmp = self._download_temp(source)
             except Exception as e:
                 yield event.plain_result(f"下载干声失败: {e}")
                 return
@@ -354,6 +384,7 @@ class LocalTtsPlugin(Star):
                     "source": source,
                     "target": str(ref_path),
                     "diffusion_steps": int(self.config.get("sing_diffusion_steps", 25)),
+                    "pitch_shift": float(self.config.get("sing_pitch_shift", 2)),
                 },
                 timeout=600,
             )
@@ -371,19 +402,20 @@ class LocalTtsPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"唱歌转换异常: {e}")
         finally:
-            if tmp:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+            for _t in (tmp, ref_tmp):
+                if _t:
+                    try:
+                        os.unlink(_t)
+                    except OSError:
+                        pass
 
     @filter.command("sing_mix")
     async def sing_mix(self, event: AstrMessageEvent, source_path: str = "", ref: str = ""):
-        """唱歌+伴奏: 用小鲸鱼唱完整歌曲 (自动 demucs 分离人声+伴奏, 合成完整版)。
+        """唱歌+伴奏: 用参考音色唱完整歌曲 (自动 demucs 分离人声+伴奏, 合成完整版)。
 
         /sing_mix <歌曲路径>        完整歌曲是本机 wav/mp3 路径 (带伴奏)
-        /sing_mix                   附带音频附件作为完整歌曲
-        可选: ref=<参考音路径>      覆盖默认小鲸鱼参考音
+        /sing_mix                   附带音频附件作为完整歌曲; 两个附件时第二个作参考音
+        可选: ref=<参考音路径/URL>  覆盖参考音色 (本机路径或 http 文件链接)
         """
         if not bool(self.config.get("sing_enable", False)):
             yield event.plain_result("唱歌模式未启用。请先在插件配置里开启 sing_enable 并重启 AstrBot。")
@@ -392,24 +424,36 @@ class LocalTtsPlugin(Star):
             yield event.plain_result("唱歌服务未运行。请使用 /sing_restart 启动 (首次模型加载约 1-2 分钟)。")
             return
 
+        atts = self._find_audio_attachments(event)
         source = (source_path or "").strip()
-        if not source:
-            att = self._find_audio_attachment(event)
-            if att:
-                source = att
+        if not source and atts:
+            source = atts[0]
         if not source:
             yield event.plain_result(
-                "请提供完整歌曲：/sing_mix <本机 wav/mp3 路径>，或直接发送一段音频附件。\n"
-                "可选 ref=<参考音路径> 覆盖默认小鲸鱼参考音。"
+                "请提供完整歌曲：/sing_mix <本机 wav/mp3 路径>，或直接发送音频附件。\n"
+                "可选 ref=<参考音路径/URL> 覆盖默认小鲸鱼参考音；发两个附件时第二个作参考音。"
             )
             return
 
         ref_path = self._sing_ref()
+        ref_tmp = None
+        ref_val = ""
         if ref:
-            ref = ref.strip()
-            if ref.startswith("ref="):
-                ref = ref[len("ref="):].strip()
-            ref_path = self._resolve_path(ref)
+            ref_val = ref.strip()
+            if ref_val.startswith("ref="):
+                ref_val = ref_val[len("ref="):].strip()
+        elif len(atts) > 1:
+            ref_val = atts[1]
+        if ref_val:
+            if str(ref_val).startswith("http"):
+                try:
+                    _, ref_tmp = self._download_temp(ref_val)
+                    ref_path = Path(ref_tmp.name)
+                except Exception as e:
+                    yield event.plain_result(f"下载参考音失败: {e}")
+                    return
+            else:
+                ref_path = self._resolve_path(ref_val)
         if not ref_path.exists():
             yield event.plain_result(f"参考音不存在: {ref_path}")
             return
@@ -418,12 +462,7 @@ class LocalTtsPlugin(Star):
         tmp = None
         if str(source).startswith("http"):
             try:
-                r = requests.get(source, timeout=120)
-                r.raise_for_status()
-                tmp = _tf.NamedTemporaryFile(suffix=".wav", delete=False)
-                tmp.write(r.content)
-                tmp.close()
-                source = tmp.name
+                source, tmp = self._download_temp(source)
             except Exception as e:
                 yield event.plain_result(f"下载歌曲失败: {e}")
                 return
@@ -436,6 +475,7 @@ class LocalTtsPlugin(Star):
                     "source": source,
                     "target": str(ref_path),
                     "diffusion_steps": int(self.config.get("sing_diffusion_steps", 25)),
+                    "pitch_shift": float(self.config.get("sing_pitch_shift", 2)),
                 },
                 timeout=900,
             )
@@ -452,11 +492,12 @@ class LocalTtsPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"唱歌合成异常: {e}")
         finally:
-            if tmp:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+            for _t in (tmp, ref_tmp):
+                if _t:
+                    try:
+                        os.unlink(_t)
+                    except OSError:
+                        pass
 
     @filter.command("sing_status")
     async def sing_status(self, event: AstrMessageEvent):
