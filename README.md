@@ -286,7 +286,7 @@ curl -L -o models/whisper-small/preprocessor_config.json "https://hf-mirror.com/
 ### 3. 使用唱歌
 
 **命令：**
-- `/点歌 <网易云链接>`：点歌并唱出来——自动从网易云下载歌曲（仅限**非 VIP/版权免费歌**，如 `https://music.163.com/song?id=xxxx` 或 QQ 分享短链 `163cn.tv/xxxx`），再用参考音色唱完整歌曲
+- `/点歌 <网易云或B站链接>`：点歌并唱出来——网易云自动下载**非 VIP/版权免费歌**（`https://music.163.com/song?id=xxxx` 或 `163cn.tv/xxxx`）；**B站**几乎任意视频都能提音频（`https://www.bilibili.com/video/BV...` 或 `b23.tv/xxxx`，走官方 API 免登录取 DASH 音频 + ffmpeg 转 wav，不受网易云版权限制），再用参考音色唱完整歌曲
 - `/sing <唱歌干声路径>`：用小鲸鱼唱本机**干声**（无伴奏人声，wav/mp3），音调=原歌、音色=参考音
 - `/sing_mix <歌曲路径>`：用小鲸鱼唱**完整歌曲**（自动 demucs 分离人声+伴奏，唱完合成伴奏，输出完整版）
 - `/sing` / `/sing_mix` + **发送一段音频附件**：用附件作输入
@@ -294,6 +294,8 @@ curl -L -o models/whisper-small/preprocessor_config.json "https://hf-mirror.com/
 - `/sing_status`：查看唱歌服务状态
 - `/sing_restart`：重启唱歌服务（首次模型加载约 1-2 分钟）
 - 可选 `ref=<参考音路径或URL>`：覆盖默认小鲸鱼参考音（本机路径或 http 文件链接）
+
+**LLM 工具（大模型可直接调用）：** 唱歌已注册为 function calling 工具 **`sing_song`**，大模型可用 `{"source": "<本地路径/网易云链接/B站链接>", "ref": "<可选参考音>"}` 调用，唱完把音频发回当前聊天。
 
 **自动唱歌：** `sing_auto=true` 时，**私聊**里发送/转发一段音频会自动用小鲸鱼唱；**群聊不会自动触发**（避免把群里别人/其他机器人的语音当成输入、误克隆他人音色）。同一时刻只允许一个唱歌任务，重复触发会提示「已有唱歌任务进行中」。
 
