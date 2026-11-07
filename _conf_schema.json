@@ -98,5 +98,10 @@
     "type": "bool",
     "default": true,
     "description": "自动唱歌: 私聊收到音频附件(无命令)自动唱完整歌曲；群聊不自动触发（避免误把群里语音当成输入、误克隆他人音色）。false=只用手动 /sing /sing_mix /点歌"
+  },
+  "sing_max_seconds": {
+    "type": "int",
+    "default": 45,
+    "description": "sing_song/点歌 自动截取音频前 N 秒演唱(避免超长歌超时; 0=不截取全曲)"
   }
 }

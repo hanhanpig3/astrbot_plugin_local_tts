@@ -173,6 +173,37 @@ class LocalTtsPlugin(Star):
                     return
                 await asyncio.sleep(1)
 
+    def _trim_audio(self, path, max_sec: int):
+        """截取音频前 max_sec 秒 (超长时), 返回新 wav 路径; 若已够短返回原路径。
+        避免超长歌曲(如 30 分钟 B站纯音乐)导致 SVC 转换超过 AstrBot 工具 300s 超时。"""
+        if not path or max_sec <= 0:
+            return path
+        try:
+            dur = float(subprocess.check_output(
+                ["/opt/homebrew/bin/ffprobe", "-v", "error",
+                 "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+            ).decode().strip())
+        except Exception:
+            return path
+        if dur <= max_sec:
+            return path
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        try:
+            subprocess.run(
+                ["/opt/homebrew/bin/ffmpeg", "-y", "-i", str(path), "-t", str(max_sec),
+                 "-codec:a", "pcm_s16le", "-ar", "44100", tmp.name],
+                check=True, capture_output=True,
+            )
+        except Exception:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            return path
+        return tmp.name
+
     async def _llm_sing_tool_impl(self, event, source="", ref=""):
         """LLM 工具处理器: 用小鲸鱼唱一首歌。event 为触发工具的消息上下文。
 
@@ -209,15 +240,20 @@ class LocalTtsPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"下载歌曲失败: {e}")
             return
+        max_sec = int(self.config.get("sing_max_seconds", 45) or 0)
+        trimmed = self._trim_audio(src_path, max_sec)
+        if trimmed != src_path:
+            yield event.plain_result(f"⏱️ 歌曲较长, 取前 {max_sec} 秒演唱 (避免超时; 配置 sing_max_seconds 可调)")
         try:
-            async for r in self._sing_mix_impl(event, src_path, ref):
+            async for r in self._sing_mix_impl(event, trimmed or src_path, ref):
                 yield r
         finally:
-            try:
-                if src_path:
-                    os.unlink(src_path)
-            except OSError:
-                pass
+            for _t in (src_path, trimmed):
+                if _t:
+                    try:
+                        os.unlink(_t)
+                    except OSError:
+                        pass
 
     # ---------------- 路径/配置辅助 ----------------
     def _svc(self) -> Path:
@@ -805,15 +841,20 @@ class LocalTtsPlugin(Star):
         except Exception as e:
             yield event.plain_result(f"下载歌曲失败: {e}")
             return
+        max_sec = int(self.config.get("sing_max_seconds", 45) or 0)
+        trimmed = self._trim_audio(src_path, max_sec)
+        if trimmed != src_path:
+            yield event.plain_result(f"⏱️ 歌曲较长, 取前 {max_sec} 秒演唱 (避免超时; 配置 sing_max_seconds 可调)")
         try:
-            async for r in self._sing_mix_impl(event, src_path, ""):
+            async for r in self._sing_mix_impl(event, trimmed or src_path, ""):
                 yield r
         finally:
-            try:
-                if src_path:
-                    os.unlink(src_path)
-            except OSError:
-                pass
+            for _t in (src_path, trimmed):
+                if _t:
+                    try:
+                        os.unlink(_t)
+                    except OSError:
+                        pass
 
     async def _netease_resolve_id(self, link: str):
         """从网易云链接解析歌曲 ID。支持 ?id= 直链 与 163cn.tv 短链(跟随 302, aiohttp 同 netease_pick)。"""
