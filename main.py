@@ -88,19 +88,24 @@ class SingSongTool(FunctionTool[AstrAgentContext]):
                     "type": "string",
                     "description": "可选参考音色(音频路径); 留空用默认小鲸鱼参考音",
                 },
+                "start": {
+                    "type": "integer",
+                    "description": "从该时间节点开始唱(秒); 例如 90=从1分30秒开始。0=从头。"
+                    "AI 需先给用户候选+时长, 用户选定后再传 start。",
+                },
             },
             "required": ["source"],
         }
     )
 
     async def call(
-        self, context: ContextWrapper[AstrAgentContext], source: str = "", ref: str = ""
+        self, context: ContextWrapper[AstrAgentContext], source: str = "", ref: str = "", start: int = 0
     ):
         event = getattr(context.context, "event", None)
         if event is None or self.plugin is None:
             yield "sing_song 工具无可用消息上下文或插件未初始化。"
             return
-        async for r in self.plugin._llm_sing_tool_impl(event, source, ref):
+        async for r in self.plugin._llm_sing_tool_impl(event, source, ref, start):
             yield r
 
 
@@ -117,8 +122,9 @@ class SearchSongTool(FunctionTool[AstrAgentContext]):
     plugin: Any = None
     name: str = "search_song"
     description: str = (
-        "按歌名(或 歌名+歌手)在网易云和B站搜索歌曲, 返回候选列表(平台/标题/歌手/链接)。"
-        "用户想唱歌但没给链接时用; 把候选展示给用户确认, 选定后调用 sing_song。"
+        "按歌名(或 歌名+歌手)在网易云和B站【同时】搜索歌曲, 返回候选列表(含时长 duration, 单位秒)。"
+        "先把候选返回给用户【人工选择】, 用户选定某候选并指定从哪个时间节点开始唱(start, 秒); "
+        "用户确认后 AI 再调用 sing_song(source=用户选定的url, start=用户指定秒数) 做裁剪演唱。"
     )
     parameters: dict[str, Any] = field(
         default_factory=lambda: {
@@ -173,9 +179,10 @@ class LocalTtsPlugin(Star):
                     return
                 await asyncio.sleep(1)
 
-    def _trim_audio(self, path, max_sec: int):
-        """截取音频前 max_sec 秒 (超长时), 返回新 wav 路径; 若已够短返回原路径。
-        避免超长歌曲(如 30 分钟 B站纯音乐)导致 SVC 转换超过 AstrBot 工具 300s 超时。"""
+    def _trim_audio(self, path, max_sec: int, start: int = 0):
+        """截取音频从 start 秒起 max_sec 秒, 返回新 wav 路径; 若无需截取返回原路径。
+        start=0 且时长未超 max_sec 时原样返回。避免超长歌曲(如 30 分钟 B站纯音乐)
+        导致 SVC 转换超过 AstrBot 工具 300s 超时; start 让用户从任意时间节点开始唱。"""
         if not path or max_sec <= 0:
             return path
         try:
@@ -186,14 +193,17 @@ class LocalTtsPlugin(Star):
             ).decode().strip())
         except Exception:
             return path
-        if dur <= max_sec:
+        start = max(0, int(start or 0))
+        if start == 0 and dur <= max_sec:
             return path
+        if start >= dur:
+            start = max(0, int(dur - max_sec))
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         tmp.close()
         try:
             subprocess.run(
-                ["/opt/homebrew/bin/ffmpeg", "-y", "-i", str(path), "-t", str(max_sec),
-                 "-codec:a", "pcm_s16le", "-ar", "44100", tmp.name],
+                ["/opt/homebrew/bin/ffmpeg", "-y", "-ss", str(start), "-i", str(path),
+                 "-t", str(max_sec), "-codec:a", "pcm_s16le", "-ar", "44100", tmp.name],
                 check=True, capture_output=True,
             )
         except Exception:
@@ -204,7 +214,7 @@ class LocalTtsPlugin(Star):
             return path
         return tmp.name
 
-    async def _llm_sing_tool_impl(self, event, source="", ref=""):
+    async def _llm_sing_tool_impl(self, event, source="", ref="", start=0):
         """LLM 工具处理器: 用小鲸鱼唱一首歌。event 为触发工具的消息上下文。
 
         与 /点歌 类似: 自动识别网易云/B站/本地, 下载后调 _sing_mix_impl, 进度+音频回给当前聊天。
@@ -241,9 +251,13 @@ class LocalTtsPlugin(Star):
             yield event.plain_result(f"下载歌曲失败: {e}")
             return
         max_sec = int(self.config.get("sing_max_seconds", 45) or 0)
-        trimmed = self._trim_audio(src_path, max_sec)
+        start_sec = max(0, int(start or 0))
+        trimmed = self._trim_audio(src_path, max_sec, start_sec)
         if trimmed != src_path:
-            yield event.plain_result(f"⏱️ 歌曲较长, 取前 {max_sec} 秒演唱 (避免超时; 配置 sing_max_seconds 可调)")
+            if start_sec > 0:
+                yield event.plain_result(f"⏱️ 从 {start_sec}s 开始取 {max_sec} 秒演唱")
+            else:
+                yield event.plain_result(f"⏱️ 歌曲较长, 取前 {max_sec} 秒演唱 (避免超时; 配置 sing_max_seconds 可调)")
         try:
             async for r in self._sing_mix_impl(event, trimmed or src_path, ref):
                 yield r
@@ -1019,6 +1033,7 @@ class LocalTtsPlugin(Star):
             if not sid:
                 continue
             artists = " / ".join(a.get("name", "") for a in so.get("artists", []) if a.get("name"))
+            dur_ms = so.get("duration") or 0
             out.append(
                 {
                     "platform": "netease",
@@ -1026,6 +1041,7 @@ class LocalTtsPlugin(Star):
                     "artist": artists,
                     "id": str(sid),
                     "url": f"https://music.163.com/song?id={sid}",
+                    "duration": round(dur_ms / 1000) if dur_ms else None,
                 }
             )
         return out
@@ -1060,6 +1076,15 @@ class LocalTtsPlugin(Star):
             if not bvid:
                 continue
             title = re.sub(r"<[^>]+>", "", v.get("title", ""))
+            dur_sec = None
+            try:
+                parts = [int(x) for x in str(v.get("duration", "")).split(":")]
+                if len(parts) == 2:
+                    dur_sec = parts[0] * 60 + parts[1]
+                elif len(parts) == 3:
+                    dur_sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            except Exception:
+                pass
             out.append(
                 {
                     "platform": "bilibili",
@@ -1067,6 +1092,7 @@ class LocalTtsPlugin(Star):
                     "artist": v.get("author", ""),
                     "id": bvid,
                     "url": f"https://www.bilibili.com/video/{bvid}",
+                    "duration": dur_sec,
                 }
             )
         return out
